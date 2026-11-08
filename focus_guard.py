@@ -45,6 +45,12 @@ BROWSER_PARTS = (
 )
 
 
+def console_log(message: str) -> None:
+    # In a PyInstaller --windowed exe, stdout may be absent altogether.
+    if sys.stdout is not None:
+        print(message)
+
+
 def load_config(path: Path) -> dict[str, Any]:
     config = json.loads(json.dumps(DEFAULT_CONFIG))
     if path.exists():
@@ -239,7 +245,11 @@ class FocusGuard:
         self.api = ActivityWatch(config["activitywatch_url"])
         self.tracker = FocusTracker({k: rule["seconds"] for k, rule in config["rules"].items()})
         self.root = tk.Tk()
-        self.root.withdraw()
+        self.status_label: ttk.Label | None = None
+        if getattr(sys, "frozen", False):
+            self.build_status_window()
+        else:
+            self.root.withdraw()
         self.popup: tk.Toplevel | None = None
         self.popup_category: str | None = None
         self.popup_since = 0.0
@@ -249,9 +259,36 @@ class FocusGuard:
         self.study_button: ttk.Button | None = None
         self.error_reported = False
 
+    def build_status_window(self) -> None:
+        self.root.title("ActivityWatch Focus Guard")
+        self.root.geometry("440x225")
+        self.root.resizable(False, False)
+        self.root.protocol("WM_DELETE_WINDOW", self.root.destroy)
+        frame = ttk.Frame(self.root, padding=24)
+        frame.pack(fill="both", expand=True)
+        ttk.Label(frame, text="Focus Guard работает", font=("Segoe UI", 16, "bold")).pack(
+            anchor="w", pady=(0, 8)
+        )
+        self.status_label = ttk.Label(frame, text="Подключаюсь к ActivityWatch…")
+        self.status_label.pack(anchor="w", pady=(0, 8))
+        ttk.Label(
+            frame, text="Окно вмешательства появится автоматически при длительном отвлечении. "
+                        "Можно свернуть это окно; программа продолжит работу.",
+            wraplength=390, justify="left"
+        ).pack(anchor="w", pady=(0, 15))
+        buttons = ttk.Frame(frame)
+        buttons.pack(fill="x")
+        ttk.Button(buttons, text="Проверить окно", command=self.show_demo).pack(side="left")
+        ttk.Button(buttons, text="Свернуть", command=self.root.iconify).pack(side="left", padx=12)
+        ttk.Button(buttons, text="Завершить", command=self.root.destroy).pack(side="right")
+
+    def show_demo(self) -> None:
+        if self.popup is None:
+            self.open_prompt("youtube", time.monotonic())
+
     def run(self) -> None:
-        print("Focus Guard running. Press Ctrl+C in the console to stop.")
-        print("Read-only ActivityWatch access; no logs or reports are created.")
+        console_log("Focus Guard running. Press Ctrl+C in the console to stop.")
+        console_log("Read-only ActivityWatch access; no logs or reports are created.")
         self.root.after(100, self.tick)
         self.root.mainloop()
 
@@ -262,12 +299,16 @@ class FocusGuard:
                 self.config["game_apps"]
             )
             self.error_reported = False
+            if self.status_label is not None:
+                self.status_label.config(text="ActivityWatch подключён · наблюдение включено")
             now = time.monotonic()
             if self.popup is None and self.tracker.observe(category, now):
                 self.open_prompt(category, now)
         except (RuntimeError, URLError, HTTPError, ValueError, TimeoutError) as exc:
+            if self.status_label is not None:
+                self.status_label.config(text="Нет соединения с ActivityWatch · повтор подключения")
             if not self.error_reported:
-                print(f"ActivityWatch unavailable: {exc}; retrying silently.")
+                console_log(f"ActivityWatch unavailable: {exc}; retrying silently.")
                 self.error_reported = True
             self.tracker.observe(None, time.monotonic())
         finally:
@@ -351,14 +392,28 @@ class FocusGuard:
 
 if __name__ == "__main__":
     try:
-        options = load_config(Path(__file__).with_name("config.json"))
+        frozen = getattr(sys, "frozen", False)
+        config_folder = Path(sys.executable).resolve().parent if frozen else Path(__file__).resolve().parent
+        options = load_config(config_folder / "config.json")
+        if sys.platform == "win32" and frozen:
+            # Prevent two background copies running after repeated double-clicks.
+            mutex = ctypes.windll.kernel32.CreateMutexW(None, True, "Local\\ActivityWatchFocusGuard")
+            if ctypes.windll.kernel32.GetLastError() == 183:
+                ctypes.windll.user32.MessageBoxW(
+                    None, "Focus Guard уже запущен.", "ActivityWatch Focus Guard", 0x40
+                )
+                sys.exit(0)
         app = FocusGuard(options)
         if "--demo" in sys.argv:
-            print("Demo mode: ActivityWatch data are not accessed.")
+            console_log("Demo mode: ActivityWatch data are not accessed.")
             app.root.after(100, lambda: app.open_prompt("youtube", time.monotonic()))
             app.root.mainloop()
         else:
             app.run()
     except (ValueError, json.JSONDecodeError, tk.TclError) as error:
-        print(f"Cannot start Focus Guard: {error}", file=sys.stderr)
+        if getattr(sys, "frozen", False) and sys.platform == "win32":
+            ctypes.windll.user32.MessageBoxW(None, f"Ошибка запуска Focus Guard: {error}",
+                                               "ActivityWatch Focus Guard", 0x10)
+        elif sys.stderr is not None:
+            print(f"Cannot start Focus Guard: {error}", file=sys.stderr)
         sys.exit(1)
