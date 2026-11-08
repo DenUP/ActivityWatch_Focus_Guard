@@ -8,9 +8,9 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "New release tag (for example v0.4.0)"
+        description: "New release tag (for example v0.5.0)"
         required: true
-        default: v0.4.0
+        default: v0.5.0
 
 permissions:
   contents: write
@@ -48,6 +48,6 @@ jobs:
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_TAG: ${{ inputs.version || 'v0.4.0' }}
+          RELEASE_TAG: ${{ inputs.version || 'v0.5.0' }}
         run: |
           gh release create $env:RELEASE_TAG "dist/ActivityWatchFocusGuard.exe" "dist/SHA256SUMS.txt" --target $env:GITHUB_SHA --title "Focus Guard $env:RELEASE_TAG" --notes-file RELEASE_NOTES.md
