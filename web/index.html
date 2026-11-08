@@ -32,7 +32,7 @@
       <div class="intro">
         <div class="eyebrow"><span class="eyebrow-line"></span> РЕЖИМ КОНЦЕНТРАЦИИ</div>
         <h1>Сосредоточься на <em>главном.</em></h1>
-        <p>Выбери время для учёбы. Пока идёт сессия, Windows ограничивает доступ к YouTube — без расширений и лишних уведомлений.</p>
+        <p>Назови первый шаг, включи защиту и работай в своём темпе. YouTube будет заблокирован в Windows — без расширений и навязчивых отчётов.</p>
       </div>
 
       <div class="main-grid">
@@ -40,24 +40,29 @@
           <div class="card-header"><div><span class="overline">ТЕКУЩАЯ СЕССИЯ</span><h2>Время для себя</h2></div><span id="statusBadge" class="badge badge-ready"><span class="badge-dot"></span><span id="statusBadgeText">Готов к старту</span></span></div>
           <div class="timer-space">
             <div class="timer-orbit" id="timerOrbit">
-              <div class="timer-core"><span class="timer-small">ОСТАЛОСЬ</span><div id="countdown" class="timer-digits" aria-live="off">25:00</div><span id="timerSubtext" class="timer-subtext">минут концентрации</span></div>
+              <div class="timer-core"><span class="timer-small">ОСТАЛОСЬ</span><div id="countdown" class="timer-digits" aria-live="off">50:00</div><span id="timerSubtext" class="timer-subtext">минут концентрации</span></div>
             </div>
           </div>
+          <div id="intentDisplay" class="intent-display" hidden><span>СЕЙЧАС МОЙ ПЕРВЫЙ ШАГ</span><strong id="intentText"></strong></div>
           <div class="timer-foot"><span class="foot-icon" aria-hidden="true">✦</span><span id="timerFootText">Небольшая сессия — хороший способ начать.</span></div>
         </section>
 
         <section class="glass control-card" aria-label="Управление учебным режимом">
           <div class="section-index">01 / НАСТРОЙ СЕССИИ</div>
           <h2>Начни прямо сейчас</h2>
-          <p class="control-intro">Определи время, когда ничто не должно отвлекать тебя от задачи.</p>
+          <p class="control-intro">Начни с одного конкретного действия. Сессию можно продлить, не открывая YouTube.</p>
           <div class="field-label">ПРОДОЛЖИТЕЛЬНОСТЬ</div>
           <div class="duration-group" role="group" aria-label="Длительность учебной сессии">
-            <button class="duration selected" type="button" data-minutes="25"><strong>25</strong><span>мин</span></button>
-            <button class="duration" type="button" data-minutes="40"><strong>40</strong><span>мин</span></button>
-            <button class="duration" type="button" data-minutes="60"><strong>60</strong><span>мин</span></button>
+            <button class="duration" type="button" data-minutes="25" aria-pressed="false"><strong>25</strong><span>мин</span></button>
+            <button class="duration selected" type="button" data-minutes="50" aria-pressed="true"><strong>50</strong><span>мин</span></button>
+            <button class="duration" type="button" data-minutes="75" aria-pressed="false"><strong>75</strong><span>мин</span></button>
           </div>
+          <label class="field-label action-label" for="firstAction">ЧТО СДЕЛАЕШЬ В ПЕРВЫЕ 2 МИНУТЫ?</label>
+          <input id="firstAction" class="action-input" type="text" maxlength="140" autocomplete="off" spellcheck="true" placeholder="Например: открыть тетрадь и решить № 1">
           <button id="startButton" class="start-button" type="button"><span>Начать учебную сессию</span><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M5 12h14m-6-6 6 6-6 6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+          <div id="extendControls" class="extend-controls" hidden><span class="field-label">НЕ ПРЕРЫВАЙ ПОТОК — ПРОДЛИ СЕССИЮ</span><div class="extend-actions"><button type="button" data-extend="25">+25 минут</button><button type="button" data-extend="50">+50 минут</button></div></div>
           <div id="stateText" class="state-box"><span class="state-icon" aria-hidden="true">●</span><span id="stateMessage">Блокировка выключена. YouTube сейчас доступен.</span></div>
+          <p class="phone-cue">📱 <span>Телефон отдельно: блокировка Windows не действует на iPhone. При необходимости включи ScreenZen.</span></p>
           <div class="control-divider"></div>
           <div class="system-row"><span class="system-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none"><rect x="3" y="4" width="18" height="16" rx="3" stroke="currentColor" stroke-width="1.7"/><path d="M3 10h18M8 7h.01M12 7h.01" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg></span><div><strong>Защита на уровне Windows</strong><small>При включении потребуется подтверждение администратора.</small></div></div>
           <button id="restoreButton" class="recovery-button" type="button" hidden>Аварийно восстановить доступ</button>
@@ -73,7 +78,7 @@
       <p class="notice">Focus Guard работает только на этом компьютере. Блокировка через hosts не абсолютна: уже открытые соединения, VPN и прокси могут обходить её. При первом запуске проверь восстановление доступа после короткой сессии.</p>
     </main>
 
-    <footer><span>FOCUS GUARD <span class="version">v0.4</span></span><span>Все данные остаются на твоём компьютере</span></footer>
+    <footer><span>FOCUS GUARD <span class="version">v0.5</span></span><span>Первый шаг хранится только до закрытия программы</span></footer>
   </div>
 
   <div id="toast" class="toast" role="status" aria-live="polite"></div>
