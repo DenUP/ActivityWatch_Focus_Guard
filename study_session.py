@@ -8,22 +8,26 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import threading
+import ctypes
 from datetime import datetime, timedelta, timezone
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit
 
 
 ALLOWED_MINUTES = (25, 40, 60)
-BRIDGE_HOST = "127.0.0.1"
-BRIDGE_PORT = 8765
 
 
 def session_path() -> Path:
-    root = os.getenv("LOCALAPPDATA")
-    folder = Path(root) if root else Path.home() / ".local" / "share"
+    if sys.platform == "win32":
+        # Shared location readable by the normal UI and an elevated helper,
+        # even if UAC requires credentials for a different admin account.
+        buffer = ctypes.create_unicode_buffer(32768)
+        status = ctypes.windll.shell32.SHGetFolderPathW(None, 0x23, None, 0, buffer)
+        folder = Path(buffer.value) if status == 0 else Path(r"C:\ProgramData")
+    else:
+        folder = Path(os.getenv("XDG_STATE_HOME", str(Path.home() / ".local" / "state")))
     return folder / "ActivityWatchFocusGuard" / "study_session.json"
 
 
@@ -76,29 +80,3 @@ class StudySession:
             )
             temporary.replace(self.path)
             return self.status(current)
-
-
-def create_status_server(session: StudySession, host: str = BRIDGE_HOST,
-                         port: int = BRIDGE_PORT) -> ThreadingHTTPServer:
-    """Read-only API for the Chrome/Edge extension; bound to loopback only."""
-
-    class Handler(BaseHTTPRequestHandler):
-        def do_GET(self) -> None:
-            if urlsplit(self.path).path != "/status":
-                self.send_error(404)
-                return
-            result = json.dumps(session.status()).encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.send_header("Cache-Control", "no-store")
-            self.send_header("X-Content-Type-Options", "nosniff")
-            self.send_header("Content-Length", str(len(result)))
-            self.end_headers()
-            self.wfile.write(result)
-
-        def log_message(self, _format: str, *args: Any) -> None:
-            pass
-
-    server = ThreadingHTTPServer((host, port), Handler)
-    server.daemon_threads = True
-    return server
