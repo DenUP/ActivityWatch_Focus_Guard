@@ -11,7 +11,7 @@ from urllib.request import Request, urlopen
 from focus_guard import run_app
 from study_session import StudySession
 from system_block import (END_MARKER, START_MARKER, WindowsHostsBlocker,
-                          block_content, remove_managed_content,
+                          block_content, extend_system_session, remove_managed_content,
                           restore_powershell_script, start_system_session)
 from web_dashboard import FocusService, create_dashboard_server
 
@@ -49,6 +49,29 @@ class StudySessionTests(unittest.TestCase):
     def test_bad_session_data_does_not_crash(self):
         self.path.write_text("{invalid!", encoding="utf-8")
         self.assertFalse(self.session.status(self.now)["active"])
+
+    def test_extension_keeps_a_single_unbroken_deadline(self):
+        initial = self.session.start(50, self.now)
+        extended = self.session.extend(25, self.now + timedelta(minutes=10))
+        self.assertEqual(extended["minutes"], 75)
+        self.assertEqual(extended["remaining_seconds"], 65 * 60)
+        self.assertNotEqual(extended["ends_at"], initial["ends_at"])
+        self.assertEqual(StudySession(self.path).status(self.now + timedelta(minutes=10))["ends_at"],
+                         extended["ends_at"])
+
+    def test_extension_rejects_expiry_invalid_durations_and_over_three_hours(self):
+        self.session.start(75, self.now)
+        for invalid in (True, 10, "25", 60):
+            with self.assertRaises(ValueError):
+                self.session.extend(invalid, self.now)
+        with self.assertRaises(ValueError):
+            self.session.extend(25, self.now + timedelta(minutes=75))
+        with self.assertRaises(ValueError):
+            self.session.extend(25, self.now + timedelta(minutes=74, seconds=45))
+        self.session.extend(50, self.now)
+        self.session.extend(50, self.now)
+        with self.assertRaisesRegex(ValueError, "three hours"):
+            self.session.extend(25, self.now)
 
 
 
@@ -121,6 +144,36 @@ class SystemBlockTests(unittest.TestCase):
         self.assertTrue(self.blocker.is_blocked())
         self.assertTrue(session.status()["active"])
 
+    @patch("system_block.is_admin", return_value=True)
+    def test_extend_updates_rollback_before_deadline_without_rewriting_hosts(self, _admin):
+        session = StudySession(Path(self.folder.name) / "session.json")
+        session.start(50)
+        self.blocker.apply()
+        original_block = self.hosts_path.read_bytes()
+        deadlines = []
+        self.blocker.schedule_restore = Mock(side_effect=lambda when: deadlines.append(when))
+        self.blocker.apply = Mock(side_effect=AssertionError("Cannot reapply an active block"))
+        old_deadline = session.status()["ends_at"]
+        result = extend_system_session(session, 25, self.blocker)
+        self.assertEqual(result["minutes"], 75)
+        self.assertEqual(self.hosts_path.read_bytes(), original_block)
+        self.assertEqual(deadlines[0], datetime.fromisoformat(old_deadline.replace("Z", "+00:00")) +
+                         timedelta(minutes=25))
+        self.blocker.apply.assert_not_called()
+
+    @patch("system_block.is_admin", return_value=True)
+    def test_extend_rolls_back_scheduled_deadline_if_state_write_fails(self, _admin):
+        session = StudySession(Path(self.folder.name) / "session.json")
+        session.start(50)
+        self.blocker.apply()
+        old_deadline = session.status()["ends_at"]
+        self.blocker.schedule_restore = Mock()
+        with patch.object(session, "extend", side_effect=OSError("disk full")):
+            with self.assertRaisesRegex(OSError, "disk full"):
+                extend_system_session(session, 25, self.blocker)
+        deadlines = [call.args[0] for call in self.blocker.schedule_restore.call_args_list]
+        self.assertEqual(deadlines[1], datetime.fromisoformat(old_deadline.replace("Z", "+00:00")))
+
 
 class DashboardTests(unittest.TestCase):
     def setUp(self):
@@ -159,6 +212,9 @@ class DashboardTests(unittest.TestCase):
         with urlopen(self.base + "/app.css") as response:
             self.assertIn("timer-orbit", response.read().decode())
         with urlopen(self.base + "/api/status") as response:
+            self.assertIsNone(json.load(response)["intent"])
+        with urlopen(Request(self.base + "/api/status", headers={
+                "X-FocusGuard-Token": self.service.access_token})) as response:
             status = json.load(response)
         self.assertEqual(status["state"], "ready")
         self.assertFalse(status["activitywatch_connected"])
@@ -185,14 +241,48 @@ class DashboardTests(unittest.TestCase):
 
     @patch("web_dashboard.is_admin", return_value=False)
     def test_valid_study_start_requests_user_controlled_uac(self, _admin):
-        with urlopen(self.json_request("/api/start", {"minutes": 25})) as response:
+        with urlopen(self.json_request("/api/start", {"minutes": 25, "intent": "Open the notebook"})) as response:
             self.assertEqual(response.status, 202)
             payload = json.load(response)
         self.assertTrue(payload["pending"])
         self.launcher.assert_called_once_with("--system-start", "25")
         with urlopen(self.base + "/api/status") as response:
-            self.assertEqual(json.load(response)["state"], "pending")
+            self.assertIsNone(json.load(response)["intent"])
+        with urlopen(Request(self.base + "/api/status", headers={
+                "X-FocusGuard-Token": self.service.access_token})) as response:
+            status = json.load(response)
+        self.assertEqual(status["state"], "pending")
+        self.assertEqual(status["intent"], "Open the notebook")
         self.assertFalse(self.session.status()["active"])
+
+    @patch("web_dashboard.is_admin", return_value=False)
+    def test_extend_requests_uac_without_unlocking_and_keeps_pending(self, _admin):
+        self.session.start(50)
+        self.service.blocker.apply()
+        with urlopen(self.json_request("/api/extend", {"minutes": 25})) as response:
+            self.assertEqual(response.status, 202)
+        self.launcher.assert_called_once_with("--system-extend", "25")
+        with urlopen(self.base + "/api/status") as response:
+            status = json.load(response)
+        self.assertEqual(status["state"], "focus")
+        self.assertEqual(status["pending_action"], "extend")
+        with self.assertRaises(HTTPError) as ctx:
+            urlopen(self.json_request("/api/extend", {"minutes": 25}))
+        self.assertEqual(ctx.exception.code, 400)
+
+    @patch("web_dashboard.is_admin", return_value=False)
+    def test_invalid_or_missing_first_step_never_requests_uac(self, _admin):
+        payloads = [{"minutes": 25}, {"minutes": 25, "intent": ""},
+                    {"minutes": 25, "intent": "ok"},
+                    {"minutes": 25, "intent": "Line\nbreak"},
+                    {"minutes": 25, "intent": 12},
+                    {"minutes": 25, "intent": "x" * 141}]
+        for payload in payloads:
+            with self.subTest(payload=payload):
+                with self.assertRaises(HTTPError) as ctx:
+                    urlopen(self.json_request("/api/start", payload))
+                self.assertEqual(ctx.exception.code, 400)
+        self.launcher.assert_not_called()
 
     @patch("web_dashboard.is_admin", return_value=False)
     def test_restore_requires_token_and_uses_uac(self, _admin):
@@ -205,7 +295,8 @@ class DashboardTests(unittest.TestCase):
         for minutes in (10, 120, "25", True):
             with self.subTest(minutes=minutes):
                 with self.assertRaises(HTTPError) as ctx:
-                    urlopen(self.json_request("/api/start", {"minutes": minutes}))
+                    urlopen(self.json_request("/api/start", {"minutes": minutes,
+                                                            "intent": "Open the notebook"}))
                 self.assertEqual(ctx.exception.code, 400)
         self.launcher.assert_not_called()
 
