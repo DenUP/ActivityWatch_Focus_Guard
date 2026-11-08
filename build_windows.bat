@@ -7,11 +7,11 @@ py -3 -m unittest -v
 if errorlevel 1 goto error
 
 echo [2/3] Installing the Windows packager...
-py -3 -m pip install --disable-pip-version-check "pyinstaller==6.22.3"
+py -3 -m pip install --disable-pip-version-check "pyinstaller==6.22.3" "pystray==0.19.5" "Pillow>=10,<13"
 if errorlevel 1 goto error
 
 echo [3/3] Building standalone Windows EXE...
-py -3 -m PyInstaller --onefile --windowed --clean --name ActivityWatchFocusGuard focus_guard.py
+py -3 -m PyInstaller --onefile --windowed --clean --hidden-import=pystray._win32 --name ActivityWatchFocusGuard focus_guard.py
 if errorlevel 1 goto error
 
 powershell -NoProfile -Command "$hash = (Get-FileHash 'dist\ActivityWatchFocusGuard.exe' -Algorithm SHA256).Hash.ToLowerInvariant(); Set-Content -Path 'dist\SHA256SUMS.txt' -Value ($hash + '  ActivityWatchFocusGuard.exe') -Encoding Ascii"
