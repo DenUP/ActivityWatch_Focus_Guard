@@ -19,9 +19,10 @@ from urllib.error import URLError
 from urllib.parse import urlsplit
 from urllib.request import urlopen
 
-from study_session import ALLOWED_MINUTES, StudySession
+from study_session import ALLOWED_MINUTES, EXTEND_MINUTES, StudySession
 from system_block import (WindowsHostsBlocker, elevated_operation_mutex,
-                          is_admin, restore_system_access, start_system_session)
+                          extend_system_session, is_admin, restore_system_access,
+                          start_system_session)
 
 
 HOST = "127.0.0.1"
@@ -45,6 +46,10 @@ class FocusService:
         self._aw_connected = False
         self._aw_lock = threading.Lock()
         self._pending_until = 0.0
+        self._pending_action: str | None = None
+        self._pending_previous_ends_at: str | None = None
+        # Deliberately memory-only: no task text is sent to GitHub or ActivityWatch.
+        self.current_intent: str | None = None
         self._action_lock = threading.Lock()
 
     def _activitywatch_connected(self) -> bool:
@@ -66,8 +71,21 @@ class FocusService:
         except (OSError, ValueError):
             blocked = False
             hosts_error = True
-        if session["active"] and blocked:
-            self._pending_until = 0.0
+        with self._action_lock:
+            if self._pending_action == "start" and session["active"] and blocked:
+                self._pending_until = 0.0
+            elif (self._pending_action == "extend" and session["active"] and blocked
+                  and session["ends_at"] != self._pending_previous_ends_at):
+                self._pending_until = 0.0
+            elif self._pending_action == "restore" and not session["active"] and not blocked:
+                self._pending_until = 0.0
+            if self._pending_until <= time.monotonic():
+                if not session["active"]:
+                    self.current_intent = None
+                self._pending_action = None
+                self._pending_previous_ends_at = None
+            pending_action = self._pending_action
+            intent = self.current_intent if session["active"] or pending_action == "start" else None
         if hosts_error:
             state = "error"
         elif session["active"] and blocked:
@@ -76,19 +94,23 @@ class FocusService:
             state = "warning"
         elif blocked:
             state = "stale"
-        elif time.monotonic() < self._pending_until:
+        elif pending_action:
             state = "pending"
         else:
             state = "ready"
         return {"state": state, "active": session["active"], "blocked": blocked,
                 "remaining_seconds": session["remaining_seconds"],
                 "ends_at": session["ends_at"], "minutes": session["minutes"],
+                "intent": intent, "pending_action": pending_action,
                 "activitywatch_connected": self._activitywatch_connected()}
 
-    def start(self, minutes: int) -> dict[str, Any]:
+    def start(self, minutes: int, intent: str) -> dict[str, Any]:
         with self._action_lock:
             if type(minutes) is not int or minutes not in ALLOWED_MINUTES:
-                raise ValueError("Choose 25, 40, or 60 minutes")
+                raise ValueError("Choose 25, 40, 50, 60, or 75 minutes")
+            if (not isinstance(intent, str) or not 4 <= len(intent.strip()) <= 140
+                    or any(ord(char) < 32 for char in intent)):
+                raise ValueError("Write a specific first action (4–140 characters, one line)")
             if time.monotonic() < self._pending_until:
                 raise ValueError("A Windows permission request is already pending")
             if self.session.status()["active"] or self.blocker.is_blocked():
@@ -96,8 +118,32 @@ class FocusService:
             if is_admin():
                 with elevated_operation_mutex():
                     start_system_session(self.session, minutes, self.blocker)
+                self.current_intent = intent.strip()
                 return {"pending": False}
             self.launch_elevated("--system-start", str(minutes))
+            self.current_intent = intent.strip()
+            self._pending_action = "start"
+            self._pending_until = time.monotonic() + 45
+            return {"pending": True}
+
+    def extend(self, minutes: int) -> dict[str, Any]:
+        with self._action_lock:
+            if type(minutes) is not int or minutes not in EXTEND_MINUTES:
+                raise ValueError("Extension must be 25 or 50 minutes")
+            if time.monotonic() < self._pending_until:
+                raise ValueError("A Windows permission request is already pending")
+            previous = self.session.status()
+            if not previous["active"] or previous["remaining_seconds"] < 30:
+                raise ValueError("No extendable active session")
+            if not self.blocker.is_blocked():
+                raise ValueError("Windows blocking must be active to extend")
+            if is_admin():
+                with elevated_operation_mutex():
+                    extend_system_session(self.session, minutes, self.blocker)
+                return {"pending": False}
+            self.launch_elevated("--system-extend", str(minutes))
+            self._pending_previous_ends_at = previous["ends_at"]
+            self._pending_action = "extend"
             self._pending_until = time.monotonic() + 45
             return {"pending": True}
 
@@ -108,8 +154,10 @@ class FocusService:
             if is_admin():
                 with elevated_operation_mutex():
                     restore_system_access(self.session, self.blocker)
+                self.current_intent = None
                 return {"pending": False}
             self.launch_elevated("--system-restore")
+            self._pending_action = "restore"
             self._pending_until = time.monotonic() + 45
             return {"pending": True}
 
@@ -148,7 +196,11 @@ def make_handler(service: FocusService, asset_root: Path,
                 return
             path = urlsplit(self.path).path
             if path == "/api/status":
-                self._json(200, service.status())
+                status = service.status()
+                if not secrets.compare_digest(self.headers.get("X-FocusGuard-Token", ""),
+                                              service.access_token):
+                    status["intent"] = None  # Do not disclose a private first step to unauthenticated local clients.
+                self._json(200, status)
                 return
             if path not in ASSETS:
                 self._json(404, {"error": "Not found"})
@@ -170,7 +222,7 @@ def make_handler(service: FocusService, asset_root: Path,
                 self._json(403, {"error": "Open this dashboard from the Focus Guard tray icon"})
                 return
             path = urlsplit(self.path).path
-            if path not in {"/api/start", "/api/restore"}:
+            if path not in {"/api/start", "/api/extend", "/api/restore"}:
                 self._json(404, {"error": "Not found"})
                 return
             try:
@@ -181,9 +233,13 @@ def make_handler(service: FocusService, asset_root: Path,
                 if not isinstance(payload, dict):
                     raise ValueError("Expected JSON object")
                 if path == "/api/start":
+                    if set(payload) != {"minutes", "intent"}:
+                        raise ValueError("Expected duration and first action")
+                    result = service.start(payload["minutes"], payload["intent"])
+                elif path == "/api/extend":
                     if set(payload) != {"minutes"}:
-                        raise ValueError("Expected duration")
-                    result = service.start(payload["minutes"])
+                        raise ValueError("Expected extension duration")
+                    result = service.extend(payload["minutes"])
                 else:
                     if payload:
                         raise ValueError("Unexpected restore fields")
