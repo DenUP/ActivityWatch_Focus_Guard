@@ -16,7 +16,8 @@ from pathlib import Path
 from typing import Any
 
 
-ALLOWED_MINUTES = (25, 40, 60)
+ALLOWED_MINUTES = (25, 40, 50, 60, 75)
+EXTEND_MINUTES = (25, 50)
 
 
 def session_path() -> Path:
@@ -66,7 +67,7 @@ class StudySession:
 
     def start(self, minutes: int, now: datetime | None = None) -> dict[str, Any]:
         if type(minutes) is not int or minutes not in ALLOWED_MINUTES:
-            raise ValueError("Study duration must be 25, 40, or 60 minutes")
+            raise ValueError("Study duration must be 25, 40, 50, 60, or 75 minutes")
         with self._lock:
             current = now or utc_now()
             if self.status(current)["active"]:
@@ -78,5 +79,26 @@ class StudySession:
                 json.dumps({"ends_at": deadline.isoformat().replace("+00:00", "Z"),
                             "minutes": minutes}), encoding="utf-8"
             )
+            temporary.replace(self.path)
+            return self.status(current)
+
+    def extend(self, minutes: int, now: datetime | None = None) -> dict[str, Any]:
+        """Extend a live deadline, never shorten it or interrupt the session."""
+        if type(minutes) is not int or minutes not in EXTEND_MINUTES:
+            raise ValueError("Extensions must be 25 or 50 minutes")
+        with self._lock:
+            current = now or utc_now()
+            previous = self.status(current)
+            if not previous["active"] or previous["remaining_seconds"] < 30:
+                raise ValueError("Cannot extend an expired or nearly completed session")
+            old_deadline = datetime.fromisoformat(previous["ends_at"].replace("Z", "+00:00"))
+            deadline = old_deadline + timedelta(minutes=minutes)
+            if deadline - current > timedelta(hours=3):
+                raise ValueError("Study block cannot exceed three hours ahead")
+            temporary = self.path.with_suffix(".tmp")
+            temporary.write_text(json.dumps({
+                "ends_at": deadline.isoformat().replace("+00:00", "Z"),
+                "minutes": previous["minutes"] + minutes,
+            }), encoding="utf-8")
             temporary.replace(self.path)
             return self.status(current)
