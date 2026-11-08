@@ -337,13 +337,15 @@ class FocusGuard:
         if self.session_label is not None:
             if status["active"]:
                 seconds = status["remaining_seconds"]
-                self.session_label.config(text=f"YouTube заблокирован: осталось {seconds // 60:02d}:{seconds % 60:02d}")
+                self.session_label.config(text=f"Учебная сессия: осталось {seconds // 60:02d}:{seconds % 60:02d}")
             else:
                 self.session_label.config(text="Учебная сессия не запущена.")
         if self.bridge_label is not None:
             message = ("Порт 8765 недоступен — блокировка не синхронизируется!"
                        if self.bridge_error else
-                       "Локальный канал готов. Статус блокировки проверь в расширении браузера.")
+                       ("Открой расширение и нажми «Проверить сейчас» для блокировки сразу."
+                        if status["active"] else
+                        "Локальный канал готов. Проверь, что расширение установлено в браузере."))
             self.bridge_label.config(text=message)
         for button in self.session_buttons:
             button.config(state="disabled" if status["active"] or self.bridge_error else "normal")
