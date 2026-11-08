@@ -1,7 +1,7 @@
-"""A privacy-first Windows intervention tool for ActivityWatch 0.14.x.
+"""A Windows study timer with browser-enforced YouTube blocking.
 
-Read-only ActivityWatch API access. The only automatic intervention is a
-reversible, user-dismissible attention prompt. No telemetry or reports.
+ActivityWatch access remains read-only; there is no telemetry or reporting.
+The optional legacy attention prompts are not the YouTube blocking mechanism.
 """
 
 from __future__ import annotations
@@ -11,6 +11,7 @@ import json
 import queue
 import re
 import sys
+import threading
 import time
 import tkinter as tk
 from dataclasses import dataclass
@@ -22,9 +23,12 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlparse
 from urllib.request import Request, urlopen
 
+from study_session import ALLOWED_MINUTES, StudySession, create_status_server, session_path
+
 
 DEFAULT_CONFIG = {
     "activitywatch_url": "http://127.0.0.1:5600",
+    "legacy_prompts_enabled": False,
     "poll_seconds": 5,
     "event_grace_seconds": 30,
     "delay_to_continue_seconds": 15,
@@ -245,8 +249,21 @@ class FocusGuard:
         self.config = config
         self.api = ActivityWatch(config["activitywatch_url"])
         self.tracker = FocusTracker({k: rule["seconds"] for k, rule in config["rules"].items()})
+        self.study_session = StudySession(session_path())
+        self.study_server = None
+        self.bridge_error = False
+        try:
+            self.study_server = create_status_server(self.study_session)
+            threading.Thread(target=self.study_server.serve_forever,
+                             name="FocusGuardBrowserBridge", daemon=True).start()
+        except OSError as error:
+            console_log(f"Browser bridge not started: {error}")
+            self.bridge_error = True
         self.root = tk.Tk()
         self.status_label: ttk.Label | None = None
+        self.session_label: ttk.Label | None = None
+        self.bridge_label: ttk.Label | None = None
+        self.session_buttons: list[ttk.Button] = []
         self.tray_icon = None
         self.tray_commands: queue.SimpleQueue[str] = queue.SimpleQueue()
         if sys.platform == "win32":
@@ -266,27 +283,72 @@ class FocusGuard:
 
     def build_status_window(self) -> None:
         self.root.title("ActivityWatch Focus Guard")
-        self.root.geometry("440x225")
+        self.root.geometry("500x335")
         self.root.resizable(False, False)
         self.root.protocol("WM_DELETE_WINDOW", self.hide_to_tray)
         self.root.bind("<Unmap>", self.on_main_unmap)
-        frame = ttk.Frame(self.root, padding=24)
+        frame = ttk.Frame(self.root, padding=22)
         frame.pack(fill="both", expand=True)
-        ttk.Label(frame, text="Focus Guard работает", font=("Segoe UI", 16, "bold")).pack(
+        ttk.Label(frame, text="Учебный режим", font=("Segoe UI", 18, "bold")).pack(
             anchor="w", pady=(0, 8)
         )
+        ttk.Label(frame, text="Во время сессии YouTube блокируется в Chrome / Edge. "
+                              "Переключение окон не сбрасывает таймер.",
+                  wraplength=455, justify="left").pack(anchor="w", pady=(0, 12))
+        durations = ttk.Frame(frame)
+        durations.pack(fill="x", pady=(0, 8))
+        for minutes in ALLOWED_MINUTES:
+            button = ttk.Button(durations, text=f"Начать {minutes} мин",
+                                command=lambda amount=minutes: self.begin_study(amount))
+            button.pack(side="left", padx=(0, 8))
+            self.session_buttons.append(button)
+        self.session_label = ttk.Label(frame, text="Учебная сессия не запущена.",
+                                       font=("Segoe UI", 11, "bold"))
+        self.session_label.pack(anchor="w", pady=(0, 8))
+        self.bridge_label = ttk.Label(frame, text="", wraplength=455)
+        self.bridge_label.pack(anchor="w", pady=(0, 8))
         self.status_label = ttk.Label(frame, text="Подключаюсь к ActivityWatch…")
-        self.status_label.pack(anchor="w", pady=(0, 8))
+        self.status_label.pack(anchor="w", pady=(0, 10))
         ttk.Label(
-            frame, text="Окно вмешательства появится автоматически при длительном отвлечении. "
-                        "Крестик и сворачивание скрывают программу в системный трей.",
-            wraplength=390, justify="left"
-        ).pack(anchor="w", pady=(0, 15))
+            frame, text="Нужно один раз установить расширение из папки browser-extension. "
+                        "Закрытие программы не отменяет уже полученную браузером блокировку.",
+            wraplength=455, justify="left"
+        ).pack(anchor="w", pady=(0, 12))
         buttons = ttk.Frame(frame)
         buttons.pack(fill="x")
-        ttk.Button(buttons, text="Проверить окно", command=self.show_demo).pack(side="left")
-        ttk.Button(buttons, text="В трей", command=self.hide_to_tray).pack(side="left", padx=12)
+        ttk.Button(buttons, text="В трей", command=self.hide_to_tray).pack(side="left")
         ttk.Button(buttons, text="Завершить", command=self.shutdown).pack(side="right")
+
+    def begin_study(self, minutes: int) -> None:
+        if self.bridge_error:
+            from tkinter import messagebox
+            messagebox.showerror("Блокировка недоступна", "Не удалось открыть локальный порт 8765. "
+                                 "Закрой другие экземпляры Focus Guard и перезапусти программу.")
+            return
+        try:
+            self.study_session.start(minutes)
+        except (ValueError, OSError) as error:
+            from tkinter import messagebox
+            messagebox.showerror("Не удалось начать сессию", str(error))
+        self.refresh_study_status(schedule_next=False)
+
+    def refresh_study_status(self, schedule_next: bool = True) -> None:
+        status = self.study_session.status()
+        if self.session_label is not None:
+            if status["active"]:
+                seconds = status["remaining_seconds"]
+                self.session_label.config(text=f"YouTube заблокирован: осталось {seconds // 60:02d}:{seconds % 60:02d}")
+            else:
+                self.session_label.config(text="Учебная сессия не запущена.")
+        if self.bridge_label is not None:
+            message = ("Порт 8765 недоступен — блокировка не синхронизируется!"
+                       if self.bridge_error else
+                       "Локальный канал готов. Статус блокировки проверь в расширении браузера.")
+            self.bridge_label.config(text=message)
+        for button in self.session_buttons:
+            button.config(state="disabled" if status["active"] or self.bridge_error else "normal")
+        if schedule_next:
+            self.root.after(1000, self.refresh_study_status)
 
     def setup_tray(self) -> None:
         """Initialize the Windows tray without touching Tk from tray callbacks."""
@@ -348,6 +410,9 @@ class FocusGuard:
         if self.tray_icon is not None:
             self.tray_icon.stop()
             self.tray_icon = None
+        if self.study_server is not None:
+            self.study_server.shutdown()
+            self.study_server.server_close()
         self.root.destroy()
 
     def show_demo(self) -> None:
@@ -355,8 +420,8 @@ class FocusGuard:
             self.open_prompt("youtube", time.monotonic())
 
     def run(self) -> None:
-        console_log("Focus Guard running. Press Ctrl+C in the console to stop.")
-        console_log("Read-only ActivityWatch access; no logs or reports are created.")
+        console_log("Focus Guard study mode ready. No logs or reports are created.")
+        self.root.after(100, self.refresh_study_status)
         self.root.after(100, self.tick)
         self.root.mainloop()
 
@@ -370,7 +435,8 @@ class FocusGuard:
             if self.status_label is not None:
                 self.status_label.config(text="ActivityWatch подключён · наблюдение включено")
             now = time.monotonic()
-            if self.popup is None and self.tracker.observe(category, now):
+            if (self.config["legacy_prompts_enabled"] and not self.study_session.status()["active"]
+                    and self.popup is None and self.tracker.observe(category, now)):
                 self.open_prompt(category, now)
         except (RuntimeError, URLError, HTTPError, ValueError, TimeoutError) as exc:
             if self.status_label is not None:
