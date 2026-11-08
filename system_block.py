@@ -8,6 +8,7 @@ the EXE is closed, moved, or deleted. No ActivityWatch data is touched.
 from __future__ import annotations
 
 import base64
+import contextlib
 import ctypes
 import os
 import subprocess
@@ -89,6 +90,30 @@ def encoded_powershell(script: str) -> str:
 
 def is_admin() -> bool:
     return sys.platform == "win32" and bool(ctypes.windll.shell32.IsUserAnAdmin())
+
+
+@contextlib.contextmanager
+def elevated_operation_mutex():
+    """Serialize elevated helpers to avoid double-click races on hosts/tasks."""
+    if sys.platform != "win32":
+        yield
+        return
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.CreateMutexW.argtypes = (ctypes.c_void_p, ctypes.c_int, ctypes.c_wchar_p)
+    kernel.CreateMutexW.restype = ctypes.c_void_p
+    kernel.ReleaseMutex.argtypes = (ctypes.c_void_p,)
+    kernel.CloseHandle.argtypes = (ctypes.c_void_p,)
+    handle = kernel.CreateMutexW(None, True, "Local\\ActivityWatchFocusGuard-ElevatedOperation")
+    if not handle:
+        raise OSError("Cannot create exclusive system operation mutex")
+    if ctypes.get_last_error() == 183:
+        kernel.CloseHandle(handle)
+        raise RuntimeError("A Focus Guard system operation is already running")
+    try:
+        yield
+    finally:
+        kernel.ReleaseMutex(handle)
+        kernel.CloseHandle(handle)
 
 
 def run_powershell(script: str) -> None:
