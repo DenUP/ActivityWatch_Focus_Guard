@@ -1,7 +1,10 @@
 import unittest
+import queue
 from datetime import datetime, timezone
+from types import SimpleNamespace
+from unittest.mock import Mock
 
-from focus_guard import FocusTracker, category_for_url, classify, event_is_live
+from focus_guard import FocusGuard, FocusTracker, category_for_url, classify, event_is_live
 
 
 class DetectionTests(unittest.TestCase):
@@ -43,6 +46,34 @@ class DetectionTests(unittest.TestCase):
         self.assertTrue(tracker.observe("youtube", 261))
         self.assertFalse(tracker.observe(None, 262))
         self.assertFalse(tracker.observe("youtube", 263))
+
+
+class TrayBehaviorTests(unittest.TestCase):
+    def test_close_hides_window_when_tray_is_ready(self):
+        root = SimpleNamespace(withdraw=Mock(), iconify=Mock())
+        fake = SimpleNamespace(root=root, tray_icon=SimpleNamespace(visible=True))
+        FocusGuard.hide_to_tray(fake)
+        root.withdraw.assert_called_once()
+        root.iconify.assert_not_called()
+
+    def test_icon_initialization_never_traps_an_invisible_app(self):
+        root = SimpleNamespace(withdraw=Mock(), iconify=Mock())
+        fake = SimpleNamespace(root=root, tray_icon=SimpleNamespace(visible=False))
+        FocusGuard.hide_to_tray(fake)
+        root.iconify.assert_called_once()
+        root.withdraw.assert_not_called()
+
+    def test_tray_menu_is_processed_on_ui_loop(self):
+        commands = queue.SimpleQueue()
+        commands.put("show")
+        fake = SimpleNamespace(
+            tray_commands=commands, show_main_window=Mock(), shutdown=Mock(),
+            process_tray_commands=Mock(),
+            root=SimpleNamespace(after=Mock())
+        )
+        FocusGuard.process_tray_commands(fake)
+        fake.show_main_window.assert_called_once()
+        fake.root.after.assert_called_once()
 
 
 if __name__ == "__main__":
