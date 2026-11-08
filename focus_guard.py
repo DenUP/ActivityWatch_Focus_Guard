@@ -1,7 +1,7 @@
-"""A Windows study timer with browser-enforced YouTube blocking.
+"""A Windows study timer with reversible system-wide YouTube blocking.
 
 ActivityWatch access remains read-only; there is no telemetry or reporting.
-The optional legacy attention prompts are not the YouTube blocking mechanism.
+The optional legacy attention prompts are not the blocking mechanism.
 """
 
 from __future__ import annotations
@@ -10,8 +10,8 @@ import ctypes
 import json
 import queue
 import re
+import subprocess
 import sys
-import threading
 import time
 import tkinter as tk
 from dataclasses import dataclass
@@ -23,7 +23,8 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlparse
 from urllib.request import Request, urlopen
 
-from study_session import ALLOWED_MINUTES, StudySession, create_status_server, session_path
+from study_session import ALLOWED_MINUTES, StudySession, session_path
+from system_block import WindowsHostsBlocker, is_admin, restore_system_access, start_system_session
 
 
 DEFAULT_CONFIG = {
@@ -250,20 +251,13 @@ class FocusGuard:
         self.api = ActivityWatch(config["activitywatch_url"])
         self.tracker = FocusTracker({k: rule["seconds"] for k, rule in config["rules"].items()})
         self.study_session = StudySession(session_path())
-        self.study_server = None
-        self.bridge_error = False
-        try:
-            self.study_server = create_status_server(self.study_session)
-            threading.Thread(target=self.study_server.serve_forever,
-                             name="FocusGuardBrowserBridge", daemon=True).start()
-        except OSError as error:
-            console_log(f"Browser bridge not started: {error}")
-            self.bridge_error = True
+        self.blocker = WindowsHostsBlocker()
         self.root = tk.Tk()
         self.status_label: ttk.Label | None = None
         self.session_label: ttk.Label | None = None
-        self.bridge_label: ttk.Label | None = None
+        self.block_label: ttk.Label | None = None
         self.session_buttons: list[ttk.Button] = []
+        self.recovery_button: ttk.Button | None = None
         self.tray_icon = None
         self.tray_commands: queue.SimpleQueue[str] = queue.SimpleQueue()
         if sys.platform == "win32":
@@ -283,8 +277,9 @@ class FocusGuard:
 
     def build_status_window(self) -> None:
         self.root.title("ActivityWatch Focus Guard")
-        self.root.geometry("500x335")
-        self.root.resizable(False, False)
+        self.root.geometry("530x370")
+        self.root.minsize(510, 355)
+        self.root.resizable(True, True)
         self.root.protocol("WM_DELETE_WINDOW", self.hide_to_tray)
         self.root.bind("<Unmap>", self.on_main_unmap)
         frame = ttk.Frame(self.root, padding=22)
@@ -292,9 +287,9 @@ class FocusGuard:
         ttk.Label(frame, text="Учебный режим", font=("Segoe UI", 18, "bold")).pack(
             anchor="w", pady=(0, 8)
         )
-        ttk.Label(frame, text="Во время сессии YouTube блокируется в Chrome / Edge. "
-                              "Переключение окон не сбрасывает таймер.",
-                  wraplength=455, justify="left").pack(anchor="w", pady=(0, 12))
+        ttk.Label(frame, text="Одна программа для Windows. YouTube ограничивается через "
+                              "системный hosts; расширение не требуется.",
+                  wraplength=480, justify="left").pack(anchor="w", pady=(0, 12))
         durations = ttk.Frame(frame)
         durations.pack(fill="x", pady=(0, 8))
         for minutes in ALLOWED_MINUTES:
@@ -305,50 +300,88 @@ class FocusGuard:
         self.session_label = ttk.Label(frame, text="Учебная сессия не запущена.",
                                        font=("Segoe UI", 11, "bold"))
         self.session_label.pack(anchor="w", pady=(0, 8))
-        self.bridge_label = ttk.Label(frame, text="", wraplength=455)
-        self.bridge_label.pack(anchor="w", pady=(0, 8))
+        self.block_label = ttk.Label(frame, text="", wraplength=480)
+        self.block_label.pack(anchor="w", pady=(0, 8))
         self.status_label = ttk.Label(frame, text="Подключаюсь к ActivityWatch…")
         self.status_label.pack(anchor="w", pady=(0, 10))
         ttk.Label(
-            frame, text="Нужно один раз установить расширение из папки browser-extension. "
-                        "Закрытие программы не отменяет уже полученную браузером блокировку.",
-            wraplength=455, justify="left"
+            frame, text="При запуске учёбы Windows попросит права администратора. "
+                        "Системное задание вернёт доступ в конце сессии, даже если EXE закрыт. "
+                        "Существующие открытые вкладки могут требовать перезапуска браузера.",
+            wraplength=480, justify="left"
         ).pack(anchor="w", pady=(0, 12))
         buttons = ttk.Frame(frame)
         buttons.pack(fill="x")
         ttk.Button(buttons, text="В трей", command=self.hide_to_tray).pack(side="left")
+        self.recovery_button = ttk.Button(buttons, text="Аварийно восстановить доступ",
+                                          command=self.recover_access)
+        self.recovery_button.pack(side="left", padx=12)
         ttk.Button(buttons, text="Завершить", command=self.shutdown).pack(side="right")
 
     def begin_study(self, minutes: int) -> None:
-        if self.bridge_error:
-            from tkinter import messagebox
-            messagebox.showerror("Блокировка недоступна", "Не удалось открыть локальный порт 8765. "
-                                 "Закрой другие экземпляры Focus Guard и перезапусти программу.")
-            return
         try:
-            self.study_session.start(minutes)
-        except (ValueError, OSError) as error:
+            if self.study_session.status()["active"]:
+                raise ValueError("Учебная сессия уже запущена")
+            if is_admin():
+                start_system_session(self.study_session, minutes, self.blocker)
+            else:
+                self.launch_elevated("--system-start", str(minutes))
+        except (ValueError, OSError, PermissionError, RuntimeError) as error:
             from tkinter import messagebox
             messagebox.showerror("Не удалось начать сессию", str(error))
         self.refresh_study_status(schedule_next=False)
 
+    def launch_elevated(self, command: str, *args: str) -> None:
+        if sys.platform != "win32":
+            raise OSError("Системная блокировка доступна только в Windows")
+        params = [command, *args]
+        if not getattr(sys, "frozen", False):
+            params.insert(0, str(Path(__file__).resolve()))
+        result = ctypes.windll.shell32.ShellExecuteW(
+            None, "runas", sys.executable, subprocess.list2cmdline(params), None, 1
+        )
+        if result <= 32:
+            raise PermissionError("Windows не предоставила права администратора")
+
+    def recover_access(self) -> None:
+        from tkinter import messagebox
+        if not messagebox.askyesno("Аварийное восстановление",
+                                   "Снять ограничение YouTube досрочно? "
+                                   "Потребуются права администратора."):
+            return
+        try:
+            if is_admin():
+                restore_system_access(self.study_session, self.blocker)
+            else:
+                self.launch_elevated("--system-restore")
+        except (OSError, PermissionError, RuntimeError, ValueError) as error:
+            messagebox.showerror("Не удалось восстановить доступ", str(error))
+        self.refresh_study_status(schedule_next=False)
+
     def refresh_study_status(self, schedule_next: bool = True) -> None:
         status = self.study_session.status()
+        try:
+            blocked = self.blocker.is_blocked()
+        except OSError:
+            blocked = False
         if self.session_label is not None:
             if status["active"]:
                 seconds = status["remaining_seconds"]
                 self.session_label.config(text=f"Учебная сессия: осталось {seconds // 60:02d}:{seconds % 60:02d}")
             else:
                 self.session_label.config(text="Учебная сессия не запущена.")
-        if self.bridge_label is not None:
-            message = ("Порт 8765 недоступен — блокировка не синхронизируется!"
-                       if self.bridge_error else
-                       ("Открой расширение и нажми «Проверить сейчас» для блокировки сразу."
-                        if status["active"] else
-                        "Локальный канал готов. Проверь, что расширение установлено в браузере."))
-            self.bridge_label.config(text=message)
+        if self.block_label is not None:
+            if status["active"] and blocked:
+                message = "Системная блокировка установлена. Переключение окон не влияет на таймер."
+            elif status["active"]:
+                message = "Внимание: сессия идёт, но блокировка hosts не обнаружена!"
+            elif blocked:
+                message = "Срок истёк, но hosts ещё заблокирован. Используй аварийное восстановление."
+            else:
+                message = "YouTube доступен. Расширение браузера больше не нужно."
+            self.block_label.config(text=message)
         for button in self.session_buttons:
-            button.config(state="disabled" if status["active"] or self.bridge_error else "normal")
+            button.config(state="disabled" if status["active"] or blocked else "normal")
         if schedule_next:
             self.root.after(1000, self.refresh_study_status)
 
@@ -412,9 +445,6 @@ class FocusGuard:
         if self.tray_icon is not None:
             self.tray_icon.stop()
             self.tray_icon = None
-        if self.study_server is not None:
-            self.study_server.shutdown()
-            self.study_server.server_close()
         self.root.destroy()
 
     def show_demo(self) -> None:
@@ -422,7 +452,7 @@ class FocusGuard:
             self.open_prompt("youtube", time.monotonic())
 
     def run(self) -> None:
-        console_log("Focus Guard study mode ready. No logs or reports are created.")
+        console_log("Focus Guard system study mode ready. No reports are created.")
         self.root.after(100, self.refresh_study_status)
         self.root.after(100, self.tick)
         self.root.mainloop()
@@ -528,6 +558,30 @@ class FocusGuard:
 
 if __name__ == "__main__":
     try:
+        if sys.platform == "win32" and len(sys.argv) > 1 and sys.argv[1] in {
+            "--system-start", "--system-restore"
+        }:
+            try:
+                if not is_admin():
+                    raise PermissionError("Administrator rights were not granted")
+                # One-shot elevated helper: never starts the GUI or claims its mutex.
+                helper_session = StudySession(session_path())
+                helper_blocker = WindowsHostsBlocker()
+                if sys.argv[1] == "--system-start":
+                    if len(sys.argv) != 3:
+                        raise ValueError("Expected a study duration")
+                    start_system_session(helper_session, int(sys.argv[2]), helper_blocker)
+                else:
+                    if len(sys.argv) != 2:
+                        raise ValueError("Unexpected restore arguments")
+                    restore_system_access(helper_session, helper_blocker)
+            except (OSError, PermissionError, RuntimeError, ValueError) as error:
+                ctypes.windll.user32.MessageBoxW(
+                    None, f"Не удалось изменить блокировку: {error}",
+                    "ActivityWatch Focus Guard", 0x10
+                )
+                sys.exit(1)
+            sys.exit(0)
         frozen = getattr(sys, "frozen", False)
         config_folder = Path(sys.executable).resolve().parent if frozen else Path(__file__).resolve().parent
         options = load_config(config_folder / "config.json")
