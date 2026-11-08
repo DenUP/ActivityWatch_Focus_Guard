@@ -16,7 +16,7 @@ import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from study_session import ALLOWED_MINUTES, StudySession
+from study_session import ALLOWED_MINUTES, EXTEND_MINUTES, StudySession
 
 
 TASK_NAME = "ActivityWatchFocusGuard-Unblock"
@@ -194,7 +194,7 @@ if ($null -ne $task) {{ Unregister-ScheduledTask -TaskName '{TASK_NAME}' -Confir
 def start_system_session(session: StudySession, minutes: int,
                          blocker: WindowsHostsBlocker) -> dict:
     if minutes not in ALLOWED_MINUTES or type(minutes) is not int:
-        raise ValueError("Only 25, 40 and 60 minute sessions are supported")
+        raise ValueError("Unsupported study duration")
     if session.status()["active"]:
         raise ValueError("A study session is already active")
     if not is_admin():
@@ -215,6 +215,33 @@ def start_system_session(session: StudySession, minutes: int,
             raise RuntimeError("Could not undo hosts changes; scheduled recovery remains installed")
         else:
             blocker.remove_restore_task()
+        raise
+
+
+def extend_system_session(session: StudySession, minutes: int,
+                          blocker: WindowsHostsBlocker) -> dict:
+    """Reschedule recovery before changing the stored deadline; keep hosts intact."""
+    if type(minutes) is not int or minutes not in EXTEND_MINUTES:
+        raise ValueError("Extensions must be 25 or 50 minutes")
+    if not is_admin():
+        raise PermissionError("Administrator permissions are required")
+    previous = session.status()
+    if not previous["active"] or previous["remaining_seconds"] < 30:
+        raise ValueError("Session is not active or is too close to ending")
+    if not blocker.is_blocked():
+        raise ValueError("Cannot extend: Windows hosts block was not found")
+    old_deadline = datetime.fromisoformat(previous["ends_at"].replace("Z", "+00:00"))
+    next_deadline = old_deadline + timedelta(minutes=minutes)
+    if next_deadline - datetime.now(timezone.utc) > timedelta(hours=3):
+        raise ValueError("Cannot schedule more than three hours ahead")
+    blocker.schedule_restore(next_deadline)
+    try:
+        return session.extend(minutes)
+    except Exception:
+        try:
+            blocker.schedule_restore(old_deadline)
+        except Exception:
+            raise RuntimeError("Could not restore the earlier deadline; use emergency recovery")
         raise
 
 
