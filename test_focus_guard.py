@@ -1,85 +1,19 @@
 import unittest
-import queue
+import json
 import tempfile
+import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from types import SimpleNamespace
 from unittest.mock import Mock, patch
+from urllib.error import HTTPError
+from urllib.request import Request, urlopen
 
-from focus_guard import FocusGuard, FocusTracker, category_for_url, classify, event_is_live
+from focus_guard import run_app
 from study_session import StudySession
 from system_block import (END_MARKER, START_MARKER, WindowsHostsBlocker,
                           block_content, remove_managed_content,
                           restore_powershell_script, start_system_session)
-
-
-class DetectionTests(unittest.TestCase):
-    def test_domains(self):
-        self.assertEqual(category_for_url("https://www.youtube.com/shorts/xyz"), "shorts")
-        self.assertEqual(category_for_url("https://youtube.com/watch?v=x"), "youtube")
-        self.assertEqual(category_for_url("https://www.instagram.com/reels/123"), "reels")
-        self.assertIsNone(category_for_url("https://youtube.com.evil.example/shorts/xyz"))
-        self.assertIsNone(category_for_url("https://github.com/ActivityWatch"))
-
-    def test_foreground_url(self):
-        self.assertEqual(classify({"app": "chrome.exe", "url": "https://youtube.com/shorts/a"},
-                                  None, []), "shorts")
-
-    def test_web_bucket_requires_matching_active_title(self):
-        window = {"app": "chrome.exe", "title": "GitHub - Google Chrome"}
-        web = {"url": "https://youtube.com/watch?v=a", "title": "Music on YouTube"}
-        self.assertIsNone(classify(window, web, []))
-        window["title"] = "Music on YouTube - Google Chrome"
-        self.assertEqual(classify(window, web, []), "youtube")
-
-    def test_ignore_foreground_app_without_browser(self):
-        self.assertIsNone(classify({"app": "Code.exe", "title": "YouTube client"}, None, []))
-
-    def test_stale_events(self):
-        now = datetime(2026, 11, 8, 16, 0, tzinfo=timezone.utc)
-        self.assertFalse(event_is_live({"timestamp": "2026-11-08T15:00:00Z",
-                                        "duration": 120, "data": {}}, now, 30))
-        self.assertTrue(event_is_live({"timestamp": "2026-11-08T15:59:45Z",
-                                       "duration": 10, "data": {}}, now, 30))
-
-    def test_snooze(self):
-        tracker = FocusTracker({"youtube": 60})
-        self.assertFalse(tracker.observe("youtube", 100))
-        self.assertFalse(tracker.observe("youtube", 159))
-        self.assertTrue(tracker.observe("youtube", 160))
-        tracker.snooze("youtube", 100, 160)
-        self.assertFalse(tracker.observe("youtube", 250))
-        self.assertTrue(tracker.observe("youtube", 261))
-        self.assertFalse(tracker.observe(None, 262))
-        self.assertFalse(tracker.observe("youtube", 263))
-
-
-class TrayBehaviorTests(unittest.TestCase):
-    def test_close_hides_window_when_tray_is_ready(self):
-        root = SimpleNamespace(withdraw=Mock(), iconify=Mock())
-        fake = SimpleNamespace(root=root, tray_icon=SimpleNamespace(visible=True))
-        FocusGuard.hide_to_tray(fake)
-        root.withdraw.assert_called_once()
-        root.iconify.assert_not_called()
-
-    def test_icon_initialization_never_traps_an_invisible_app(self):
-        root = SimpleNamespace(withdraw=Mock(), iconify=Mock())
-        fake = SimpleNamespace(root=root, tray_icon=SimpleNamespace(visible=False))
-        FocusGuard.hide_to_tray(fake)
-        root.iconify.assert_called_once()
-        root.withdraw.assert_not_called()
-
-    def test_tray_menu_is_processed_on_ui_loop(self):
-        commands = queue.SimpleQueue()
-        commands.put("show")
-        fake = SimpleNamespace(
-            tray_commands=commands, show_main_window=Mock(), shutdown=Mock(),
-            process_tray_commands=Mock(),
-            root=SimpleNamespace(after=Mock())
-        )
-        FocusGuard.process_tray_commands(fake)
-        fake.show_main_window.assert_called_once()
-        fake.root.after.assert_called_once()
+from web_dashboard import FocusService, create_dashboard_server
 
 
 class StudySessionTests(unittest.TestCase):
@@ -186,6 +120,112 @@ class SystemBlockTests(unittest.TestCase):
         self.assertEqual(operations, ["schedule", "apply"])
         self.assertTrue(self.blocker.is_blocked())
         self.assertTrue(session.status()["active"])
+
+
+class DashboardTests(unittest.TestCase):
+    def setUp(self):
+        self.folder = tempfile.TemporaryDirectory()
+        self.addCleanup(self.folder.cleanup)
+        self.hosts = Path(self.folder.name) / "hosts"
+        self.hosts.write_bytes(b"127.0.0.1 localhost\r\n")
+        self.session = StudySession(Path(self.folder.name) / "session.json")
+        self.launcher = Mock()
+        self.service = FocusService(self.session, WindowsHostsBlocker(self.hosts),
+                                    self.launcher, activitywatch_url="http://127.0.0.1:1")
+        self.server = create_dashboard_server(
+            self.service, Path(__file__).parent / "web", port=0
+        )
+        self.worker = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.worker.start()
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
+        self.base = f"http://127.0.0.1:{self.server.server_address[1]}"
+
+    def json_request(self, path, payload, token=True, origin=True):
+        headers = {"Content-Type": "application/json"}
+        if token:
+            headers["X-FocusGuard-Token"] = self.service.access_token
+        if origin:
+            headers["Origin"] = self.base
+        return Request(self.base + path, data=json.dumps(payload).encode(),
+                       headers=headers, method="POST")
+
+    def test_serves_dashboard_from_loopback_without_taskbar_ui(self):
+        with urlopen(self.base + "/") as response:
+            html = response.read().decode("utf-8")
+            self.assertEqual(response.headers["X-Frame-Options"], "DENY")
+        self.assertIn("Focus Guard", html)
+        self.assertIn("/app.js", html)
+        with urlopen(self.base + "/app.css") as response:
+            self.assertIn("timer-orbit", response.read().decode())
+        with urlopen(self.base + "/api/status") as response:
+            status = json.load(response)
+        self.assertEqual(status["state"], "ready")
+        self.assertFalse(status["activitywatch_connected"])
+
+    def test_rejects_bad_host_header(self):
+        request = Request(self.base + "/", headers={"Host": "bad.example"})
+        with self.assertRaises(HTTPError) as ctx:
+            urlopen(request)
+        self.assertEqual(ctx.exception.code, 403)
+
+    def test_rejects_cross_site_or_missing_token_posts(self):
+        for token, origin in ((False, True), (True, False), (False, False)):
+            with self.subTest(token=token, origin=origin):
+                with self.assertRaises(HTTPError) as ctx:
+                    urlopen(self.json_request("/api/start", {"minutes": 25}, token, origin))
+                self.assertEqual(ctx.exception.code, 403)
+        forged = self.json_request("/api/start", {"minutes": 25})
+        forged.add_header("Origin", "https://evil.example")
+        with self.assertRaises(HTTPError) as ctx:
+            urlopen(forged)
+        self.assertEqual(ctx.exception.code, 403)
+        self.launcher.assert_not_called()
+
+
+    @patch("web_dashboard.is_admin", return_value=False)
+    def test_valid_study_start_requests_user_controlled_uac(self, _admin):
+        with urlopen(self.json_request("/api/start", {"minutes": 25})) as response:
+            self.assertEqual(response.status, 202)
+            payload = json.load(response)
+        self.assertTrue(payload["pending"])
+        self.launcher.assert_called_once_with("--system-start", "25")
+        with urlopen(self.base + "/api/status") as response:
+            self.assertEqual(json.load(response)["state"], "pending")
+        self.assertFalse(self.session.status()["active"])
+
+    @patch("web_dashboard.is_admin", return_value=False)
+    def test_restore_requires_token_and_uses_uac(self, _admin):
+        with urlopen(self.json_request("/api/restore", {})) as response:
+            self.assertEqual(response.status, 202)
+        self.launcher.assert_called_once_with("--system-restore")
+
+    @patch("web_dashboard.is_admin", return_value=False)
+    def test_rejects_invalid_study_duration_before_uac(self, _admin):
+        for minutes in (10, 120, "25", True):
+            with self.subTest(minutes=minutes):
+                with self.assertRaises(HTTPError) as ctx:
+                    urlopen(self.json_request("/api/start", {"minutes": minutes}))
+                self.assertEqual(ctx.exception.code, 400)
+        self.launcher.assert_not_called()
+
+
+class TrayStartupTests(unittest.TestCase):
+    @patch("focus_guard.webbrowser.open_new_tab")
+    @patch("focus_guard.make_tray_icon")
+    @patch("focus_guard.create_dashboard_server")
+    @patch("focus_guard.FocusService")
+    def test_tray_starts_localhost_without_any_tk_window(self, service_type, server_factory,
+                                                         tray_factory, browser_open):
+        service_type.return_value.access_token = "test-secret"
+        fake_server = server_factory.return_value
+        fake_icon = tray_factory.return_value
+        fake_icon.run.side_effect = lambda setup=None: setup(fake_icon) if setup else None
+        self.assertEqual(run_app(), 0)
+        fake_icon.run.assert_called_once()
+        browser_open.assert_called_once_with("http://127.0.0.1:8766/#token=test-secret")
+        fake_icon.stop.assert_called_once()
+        fake_server.shutdown.assert_called_once()
 
 
 if __name__ == "__main__":
