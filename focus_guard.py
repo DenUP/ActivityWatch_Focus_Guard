@@ -24,7 +24,8 @@ from urllib.parse import quote, urlparse
 from urllib.request import Request, urlopen
 
 from study_session import ALLOWED_MINUTES, StudySession, session_path
-from system_block import WindowsHostsBlocker, is_admin, restore_system_access, start_system_session
+from system_block import (WindowsHostsBlocker, elevated_operation_mutex, is_admin,
+                          restore_system_access, start_system_session)
 
 
 DEFAULT_CONFIG = {
@@ -323,7 +324,8 @@ class FocusGuard:
             if self.study_session.status()["active"]:
                 raise ValueError("Учебная сессия уже запущена")
             if is_admin():
-                start_system_session(self.study_session, minutes, self.blocker)
+                with elevated_operation_mutex():
+                    start_system_session(self.study_session, minutes, self.blocker)
             else:
                 self.launch_elevated("--system-start", str(minutes))
         except (ValueError, OSError, PermissionError, RuntimeError) as error:
@@ -351,7 +353,8 @@ class FocusGuard:
             return
         try:
             if is_admin():
-                restore_system_access(self.study_session, self.blocker)
+                with elevated_operation_mutex():
+                    restore_system_access(self.study_session, self.blocker)
             else:
                 self.launch_elevated("--system-restore")
         except (OSError, PermissionError, RuntimeError, ValueError) as error:
@@ -565,16 +568,17 @@ if __name__ == "__main__":
                 if not is_admin():
                     raise PermissionError("Administrator rights were not granted")
                 # One-shot elevated helper: never starts the GUI or claims its mutex.
-                helper_session = StudySession(session_path())
-                helper_blocker = WindowsHostsBlocker()
-                if sys.argv[1] == "--system-start":
-                    if len(sys.argv) != 3:
-                        raise ValueError("Expected a study duration")
-                    start_system_session(helper_session, int(sys.argv[2]), helper_blocker)
-                else:
-                    if len(sys.argv) != 2:
-                        raise ValueError("Unexpected restore arguments")
-                    restore_system_access(helper_session, helper_blocker)
+                with elevated_operation_mutex():
+                    helper_session = StudySession(session_path())
+                    helper_blocker = WindowsHostsBlocker()
+                    if sys.argv[1] == "--system-start":
+                        if len(sys.argv) != 3:
+                            raise ValueError("Expected a study duration")
+                        start_system_session(helper_session, int(sys.argv[2]), helper_blocker)
+                    else:
+                        if len(sys.argv) != 2:
+                            raise ValueError("Unexpected restore arguments")
+                        restore_system_access(helper_session, helper_blocker)
             except (OSError, PermissionError, RuntimeError, ValueError) as error:
                 ctypes.windll.user32.MessageBoxW(
                     None, f"Не удалось изменить блокировку: {error}",
