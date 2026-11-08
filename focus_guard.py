@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import ctypes
 import json
+import queue
 import re
 import sys
 import time
@@ -246,7 +247,9 @@ class FocusGuard:
         self.tracker = FocusTracker({k: rule["seconds"] for k, rule in config["rules"].items()})
         self.root = tk.Tk()
         self.status_label: ttk.Label | None = None
-        if getattr(sys, "frozen", False):
+        self.tray_icon = None
+        self.tray_commands: queue.SimpleQueue[str] = queue.SimpleQueue()
+        if sys.platform == "win32":
             self.build_status_window()
         else:
             self.root.withdraw()
@@ -258,12 +261,15 @@ class FocusGuard:
         self.break_button: ttk.Button | None = None
         self.study_button: ttk.Button | None = None
         self.error_reported = False
+        if sys.platform == "win32":
+            self.setup_tray()
 
     def build_status_window(self) -> None:
         self.root.title("ActivityWatch Focus Guard")
         self.root.geometry("440x225")
         self.root.resizable(False, False)
-        self.root.protocol("WM_DELETE_WINDOW", self.root.destroy)
+        self.root.protocol("WM_DELETE_WINDOW", self.hide_to_tray)
+        self.root.bind("<Unmap>", self.on_main_unmap)
         frame = ttk.Frame(self.root, padding=24)
         frame.pack(fill="both", expand=True)
         ttk.Label(frame, text="Focus Guard работает", font=("Segoe UI", 16, "bold")).pack(
@@ -273,14 +279,76 @@ class FocusGuard:
         self.status_label.pack(anchor="w", pady=(0, 8))
         ttk.Label(
             frame, text="Окно вмешательства появится автоматически при длительном отвлечении. "
-                        "Можно свернуть это окно; программа продолжит работу.",
+                        "Крестик и сворачивание скрывают программу в системный трей.",
             wraplength=390, justify="left"
         ).pack(anchor="w", pady=(0, 15))
         buttons = ttk.Frame(frame)
         buttons.pack(fill="x")
         ttk.Button(buttons, text="Проверить окно", command=self.show_demo).pack(side="left")
-        ttk.Button(buttons, text="Свернуть", command=self.root.iconify).pack(side="left", padx=12)
-        ttk.Button(buttons, text="Завершить", command=self.root.destroy).pack(side="right")
+        ttk.Button(buttons, text="В трей", command=self.hide_to_tray).pack(side="left", padx=12)
+        ttk.Button(buttons, text="Завершить", command=self.shutdown).pack(side="right")
+
+    def setup_tray(self) -> None:
+        """Initialize the Windows tray without touching Tk from tray callbacks."""
+        try:
+            import pystray
+            from PIL import Image, ImageDraw
+
+            image = Image.new("RGB", (64, 64), "#1c3040")
+            draw = ImageDraw.Draw(image)
+            draw.rounded_rectangle((7, 7, 57, 57), radius=13, fill="#21866c")
+            draw.line([(18, 33), (28, 43), (47, 22)], fill="white", width=7, joint="curve")
+            self.tray_icon = pystray.Icon(
+                "ActivityWatchFocusGuard", image, "ActivityWatch Focus Guard",
+                menu=pystray.Menu(
+                    pystray.MenuItem("Открыть", lambda _icon, _item: self.tray_commands.put("show"),
+                                    default=True),
+                    pystray.MenuItem("Завершить", lambda _icon, _item: self.tray_commands.put("exit")),
+                ),
+            )
+            self.tray_icon.run_detached()
+            self.root.after(200, self.process_tray_commands)
+        except (ImportError, OSError, RuntimeError, NotImplementedError) as error:
+            # Never hide the last way to close the application if the tray fails.
+            self.tray_icon = None
+            console_log(f"Tray unavailable: {error}")
+            if self.status_label is not None:
+                self.status_label.config(text="Трей недоступен · крестик завершит программу")
+
+    def process_tray_commands(self) -> None:
+        while not self.tray_commands.empty():
+            command = self.tray_commands.get_nowait()
+            if command == "show":
+                self.show_main_window()
+            elif command == "exit":
+                self.shutdown()
+                return
+        self.root.after(200, self.process_tray_commands)
+
+    def hide_to_tray(self) -> None:
+        if self.tray_icon is not None and self.tray_icon.visible:
+            self.root.withdraw()
+        elif self.tray_icon is not None:
+            # Icon may still be initializing; avoid making the app invisible.
+            self.root.iconify()
+        else:
+            self.shutdown()
+
+    def on_main_unmap(self, event: tk.Event) -> None:
+        if event.widget is self.root and self.root.state() == "iconic":
+            if self.tray_icon is not None and self.tray_icon.visible:
+                self.root.after_idle(self.hide_to_tray)
+
+    def show_main_window(self) -> None:
+        self.root.deiconify()
+        self.root.lift()
+        self.root.focus_force()
+
+    def shutdown(self) -> None:
+        if self.tray_icon is not None:
+            self.tray_icon.stop()
+            self.tray_icon = None
+        self.root.destroy()
 
     def show_demo(self) -> None:
         if self.popup is None:
