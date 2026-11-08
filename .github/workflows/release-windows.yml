@@ -8,9 +8,9 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "New release tag (for example v0.2.0)"
+        description: "New release tag (for example v0.3.0)"
         required: true
-        default: v0.2.0
+        default: v0.3.0
 
 permissions:
   contents: write
@@ -36,23 +36,18 @@ jobs:
           python -m pip install --disable-pip-version-check "pyinstaller==6.22.3" "pystray==0.19.5" "Pillow>=10,<13"
           python -m PyInstaller --onefile --windowed --clean --hidden-import=pystray._win32 --name ActivityWatchFocusGuard focus_guard.py
 
-      - name: Pack extension and write checksums
+      - name: Write executable checksum
         shell: pwsh
         run: |
           $exe = "dist/ActivityWatchFocusGuard.exe"
           if (!(Test-Path $exe)) { throw "Executable is missing" }
-          Compress-Archive -Path "browser-extension/*" -DestinationPath "dist/FocusGuardBrowserExtension.zip" -Force
-          $names = @("ActivityWatchFocusGuard.exe", "FocusGuardBrowserExtension.zip")
-          $lines = foreach ($name in $names) {
-            $hash = (Get-FileHash "dist/$name" -Algorithm SHA256).Hash.ToLowerInvariant()
-            "$hash  $name"
-          }
-          $lines | Out-File -FilePath "dist/SHA256SUMS.txt" -Encoding ascii
+          $hash = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  ActivityWatchFocusGuard.exe" | Out-File -FilePath "dist/SHA256SUMS.txt" -Encoding ascii
 
       - name: Publish GitHub Release
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_TAG: ${{ inputs.version || 'v0.2.0' }}
+          RELEASE_TAG: ${{ inputs.version || 'v0.3.0' }}
         run: |
-          gh release create $env:RELEASE_TAG "dist/ActivityWatchFocusGuard.exe" "dist/FocusGuardBrowserExtension.zip" "dist/SHA256SUMS.txt" --target $env:GITHUB_SHA --title "Focus Guard $env:RELEASE_TAG" --notes-file RELEASE_NOTES.md
+          gh release create $env:RELEASE_TAG "dist/ActivityWatchFocusGuard.exe" "dist/SHA256SUMS.txt" --target $env:GITHUB_SHA --title "Focus Guard $env:RELEASE_TAG" --notes-file RELEASE_NOTES.md
