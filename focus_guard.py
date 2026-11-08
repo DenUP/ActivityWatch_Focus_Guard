@@ -16,7 +16,8 @@ from pathlib import Path
 
 from study_session import StudySession, session_path
 from system_block import (WindowsHostsBlocker, elevated_operation_mutex,
-                          is_admin, restore_system_access, start_system_session)
+                          extend_system_session, is_admin, restore_system_access,
+                          start_system_session)
 from web_dashboard import HOST, PORT, FocusService, create_dashboard_server
 
 
@@ -52,6 +53,10 @@ def execute_elevated_helper(arguments: list[str]) -> int:
                 if len(arguments) != 2:
                     raise ValueError("Expected study duration")
                 start_system_session(session, int(arguments[1]), blocker)
+            elif arguments[0] == "--system-extend":
+                if len(arguments) != 2:
+                    raise ValueError("Expected extension duration")
+                extend_system_session(session, int(arguments[1]), blocker)
             elif arguments[0] == "--system-restore":
                 if len(arguments) != 1:
                     raise ValueError("Unexpected restore parameters")
@@ -148,7 +153,7 @@ def run_app(open_on_start: bool = True) -> int:
 
 def main() -> int:
     args = sys.argv[1:]
-    if args and args[0] in {"--system-start", "--system-restore"}:
+    if args and args[0] in {"--system-start", "--system-extend", "--system-restore"}:
         return execute_elevated_helper(args)
     if args not in ([], ["--tray-only"]):
         notify_windows("Неизвестные параметры запуска.", error=True)
