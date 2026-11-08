@@ -1,17 +1,16 @@
 import unittest
 import queue
-import json
 import tempfile
-import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock
-from urllib.error import HTTPError
-from urllib.request import urlopen
+from unittest.mock import Mock, patch
 
 from focus_guard import FocusGuard, FocusTracker, category_for_url, classify, event_is_live
-from study_session import StudySession, create_status_server
+from study_session import StudySession
+from system_block import (END_MARKER, START_MARKER, WindowsHostsBlocker,
+                          block_content, remove_managed_content,
+                          restore_powershell_script, start_system_session)
 
 
 class DetectionTests(unittest.TestCase):
@@ -117,22 +116,76 @@ class StudySessionTests(unittest.TestCase):
         self.path.write_text("{invalid!", encoding="utf-8")
         self.assertFalse(self.session.status(self.now)["active"])
 
-    def test_bridge_exposes_only_anonymous_status(self):
-        self.session.start(60, self.now)
-        server = create_status_server(self.session, port=0)
-        worker = threading.Thread(target=server.serve_forever, daemon=True)
-        worker.start()
-        self.addCleanup(server.server_close)
-        self.addCleanup(server.shutdown)
-        port = server.server_address[1]
-        with urlopen(f"http://127.0.0.1:{port}/status") as response:
-            self.assertEqual(response.status, 200)
-            payload = json.load(response)
-        self.assertIn("active", payload)
-        self.assertEqual(set(payload), {"active", "ends_at", "remaining_seconds", "minutes"})
-        with self.assertRaises(HTTPError) as context:
-            urlopen(f"http://127.0.0.1:{port}/events")
-        self.assertEqual(context.exception.code, 404)
+
+
+class SystemBlockTests(unittest.TestCase):
+    def setUp(self):
+        self.folder = tempfile.TemporaryDirectory()
+        self.addCleanup(self.folder.cleanup)
+        self.hosts_path = Path(self.folder.name) / "hosts"
+        self.original = b"127.0.0.1 localhost\r\n\x80 user entry\r\n"
+        self.hosts_path.write_bytes(self.original)
+        self.blocker = WindowsHostsBlocker(self.hosts_path)
+
+    def test_hosts_are_byte_for_byte_restored(self):
+        self.blocker.apply()
+        self.assertTrue(self.blocker.is_blocked())
+        self.assertIn(b"0.0.0.0 www.youtube.com", self.hosts_path.read_bytes())
+        self.blocker.restore()
+        self.assertEqual(self.hosts_path.read_bytes(), self.original)
+
+    def test_hosts_without_trailing_newline_are_preserved(self):
+        original = b"127.0.0.1 localhost"
+        self.hosts_path.write_bytes(original)
+        self.blocker.apply()
+        self.blocker.restore()
+        self.assertEqual(self.hosts_path.read_bytes(), original)
+
+    def test_other_program_edits_are_retained(self):
+        self.blocker.apply()
+        self.hosts_path.write_bytes(self.hosts_path.read_bytes() + b"10.0.0.1 other.app\r\n")
+        self.blocker.restore()
+        self.assertEqual(self.hosts_path.read_bytes(), self.original + b"10.0.0.1 other.app\r\n")
+
+    def test_corrupt_managed_region_requires_manual_recovery(self):
+        with self.assertRaises(ValueError):
+            remove_managed_content(self.original + START_MARKER + b"0.0.0.0 youtube.com\r\n")
+        with self.assertRaises(ValueError):
+            remove_managed_content(self.original + END_MARKER)
+        with self.assertRaises(ValueError):
+            remove_managed_content(self.original + block_content() + block_content())
+
+    def test_scheduled_task_contains_standalone_restore_code(self):
+        script = restore_powershell_script()
+        self.assertIn("System.IO.File", script)
+        self.assertIn("ActivityWatchFocusGuard managed block", script)
+        self.assertIn("28591", script)  # Lossless round-trip of arbitrary bytes.
+
+    @patch("system_block.is_admin", return_value=True)
+    def test_scheduler_failure_leaves_hosts_untouched(self, _admin):
+        session = StudySession(Path(self.folder.name) / "session.json")
+        self.blocker.schedule_restore = Mock(side_effect=RuntimeError("Tasks disabled"))
+        with self.assertRaisesRegex(RuntimeError, "Tasks disabled"):
+            start_system_session(session, 25, self.blocker)
+        self.assertEqual(self.hosts_path.read_bytes(), self.original)
+        self.assertFalse(session.status()["active"])
+
+    @patch("system_block.is_admin", return_value=True)
+    def test_success_schedules_rollback_before_modifying_hosts(self, _admin):
+        session = StudySession(Path(self.folder.name) / "session.json")
+        operations = []
+        self.blocker.schedule_restore = Mock(side_effect=lambda _: operations.append("schedule"))
+        real_apply = self.blocker.apply
+
+        def apply():
+            operations.append("apply")
+            real_apply()
+
+        self.blocker.apply = apply
+        start_system_session(session, 40, self.blocker)
+        self.assertEqual(operations, ["schedule", "apply"])
+        self.assertTrue(self.blocker.is_blocked())
+        self.assertTrue(session.status()["active"])
 
 
 if __name__ == "__main__":
