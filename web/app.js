@@ -8,13 +8,18 @@ const timerFootText = document.querySelector("#timerFootText");
 const badge = document.querySelector("#statusBadge");
 const badgeText = document.querySelector("#statusBadgeText");
 const startButton = document.querySelector("#startButton");
+const firstAction = document.querySelector("#firstAction");
+const intentDisplay = document.querySelector("#intentDisplay");
+const intentText = document.querySelector("#intentText");
+const extendControls = document.querySelector("#extendControls");
+const extendButtons = [...document.querySelectorAll("[data-extend]")];
 const restoreButton = document.querySelector("#restoreButton");
 const stateText = document.querySelector("#stateText");
 const stateMessage = document.querySelector("#stateMessage");
 const dialog = document.querySelector("#restoreDialog");
 const toast = document.querySelector("#toast");
 
-let chosenMinutes = 25;
+let chosenMinutes = 50;
 let currentStatus = null;
 let busy = false;
 let toastTimeout = null;
@@ -42,7 +47,7 @@ function displayTime(seconds) {
 }
 
 function setDuration(minutes) {
-  if (currentStatus?.active || currentStatus?.blocked || busy) return;
+  if (currentStatus?.active || currentStatus?.blocked || currentStatus?.pending_action || busy) return;
   chosenMinutes = minutes;
   minuteButtons.forEach(button => {
     const selected = Number(button.dataset.minutes) === minutes;
@@ -70,9 +75,9 @@ function renderTimer() {
 function renderStatus(status) {
   currentStatus = status;
   const messages = {
-    ready: ["Готов к старту", "Блокировка выключена. YouTube доступен.", "Небольшая сессия — хороший способ начать."],
+    ready: ["Готов к старту", "Блокировка выключена. YouTube доступен.", "Выбери одно действие и начни с него."],
     pending: ["Ожидаем Windows", "Подтверди запрос администратора Windows. Если отменил, подожди немного.", "Ещё один шаг — и можно сосредоточиться."],
-    focus: ["Сессия активна", "Блокировка Windows установлена. Переключение окон не сбросит таймер.", "Выдели это время одной важной задаче."],
+    focus: ["Сессия активна", "Блокировка Windows установлена. Переключение окон не сбросит таймер.", "Можно работать дальше без обязательных перерывов."],
     warning: ["Проверить блокировку", "Таймер идёт, но блокировку hosts не удалось обнаружить. Проверь запуск от администратора.", "Проверь доступ к YouTube и состояние Windows."],
     stale: ["Нужна проверка", "Время вышло, а ограничения hosts ещё обнаружены. Используй аварийное восстановление.", "Доступ должен автоматически восстановиться."],
     error: ["Ошибка Windows", "Не удалось прочитать системный файл hosts. Проверь разрешения или восстанови доступ.", "Проверка состояния требует внимания."]
@@ -81,19 +86,27 @@ function renderStatus(status) {
   badgeText.textContent = label;
   badge.className = `badge ${status.state === "focus" ? "badge-focus" :
     ["warning", "stale", "error"].includes(status.state) ? "badge-warning" : "badge-ready"}`;
-  stateMessage.textContent = !token ? "Для управления открой эту страницу через значок Focus Guard в трее." : text;
+  stateMessage.textContent = !token ? "Для управления открой эту страницу через значок Focus Guard в трее." :
+    status.pending_action === "extend" ? "Windows запрашивает разрешение продлить защиту. YouTube остаётся заблокированным." : text;
   stateText.classList.toggle("warning", ["warning", "stale", "error"].includes(status.state));
   timerFootText.textContent = foot;
   document.querySelector("#activityWatchStatus").textContent = status.activitywatch_connected
     ? "ActivityWatch подключён." : "ActivityWatch сейчас не подключён.";
 
-  const lockSelection = status.active || status.blocked || status.state === "pending" || busy;
+  const lockSelection = status.active || status.blocked || !!status.pending_action || busy;
   minuteButtons.forEach(button => { button.disabled = lockSelection; });
+  firstAction.disabled = lockSelection;
   startButton.disabled = lockSelection || !token || status.state === "error";
   startButton.querySelector("span").textContent = status.active ? "Сессия уже идёт" :
     status.state === "pending" ? "Ожидаем подтверждения…" : "Начать учебную сессию";
   restoreButton.hidden = !(status.active || status.blocked);
-  restoreButton.disabled = busy || !token;
+  restoreButton.disabled = busy || !!status.pending_action || !token;
+  intentDisplay.hidden = !status.intent;
+  intentText.textContent = status.intent || "";
+  extendControls.hidden = !(status.active && status.blocked);
+  extendButtons.forEach(button => {
+    button.disabled = busy || !!status.pending_action || !token || status.remaining_seconds < 30;
+  });
   renderTimer();
 }
 
@@ -130,7 +143,9 @@ async function requestAction(path, payload) {
 
 async function refreshStatus() {
   try {
-    const response = await fetch("/api/status", { cache: "no-store" });
+    const response = await fetch("/api/status", {
+      cache: "no-store", headers: token ? { "X-FocusGuard-Token": token } : {}
+    });
     if (!response.ok) throw new Error("Focus Guard не отвечает");
     renderStatus(await response.json());
   } catch (_) {
@@ -143,13 +158,27 @@ async function refreshStatus() {
 }
 
 minuteButtons.forEach(button => button.addEventListener("click", () => setDuration(Number(button.dataset.minutes))));
-startButton.addEventListener("click", () => requestAction("/api/start", { minutes: chosenMinutes }));
+startButton.addEventListener("click", () => {
+  const intent = firstAction.value.trim();
+  if (intent.length < 4) {
+    showToast("Назови первый конкретный шаг (не меньше 4 символов).", true);
+    firstAction.focus();
+    return;
+  }
+  requestAction("/api/start", { minutes: chosenMinutes, intent });
+});
+firstAction.addEventListener("keydown", event => {
+  if (event.key === "Enter") { event.preventDefault(); startButton.click(); }
+});
+extendButtons.forEach(button => button.addEventListener("click", () => {
+  requestAction("/api/extend", { minutes: Number(button.dataset.extend) });
+}));
 restoreButton.addEventListener("click", () => dialog.showModal());
 dialog.addEventListener("close", () => {
   if (dialog.returnValue === "confirm") requestAction("/api/restore", {});
 });
 
-setDuration(25);
+setDuration(50);
 clockTime();
 refreshStatus();
 setInterval(clockTime, 1000);
